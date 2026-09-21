@@ -980,3 +980,280 @@ describe("constructor argument reconstruction: Uniswap v4 tokens", function () {
     expect(lines.join("\n")).to.include(FQN.HoodSaleTokenV4);
   });
 });
+
+describe("constructor argument reconstruction: Uniswap v4 fee mode", function () {
+  const { deployPlatformV4Fee, taxConfig, feeTaxConfig, PERMIT2 } = require("./v4/helpers");
+  const Miner = require("../scripts/lib/hook-miner");
+
+  // Fee mode next to hook mode on one TokenFactory. One fee mode token of each type, created
+  // through the V4FeeLauncher: the same two token contracts as hook mode, with the fee launcher as
+  // their launcher. As controls, a hook mode token and a V2 token from the same Fee deployers.
+  async function feeFixture() {
+    const env = await deployPlatformV4Fee();
+    const { launcher, hook, feeLauncher, feeHook, v4Lens, v4Router, v4FeeLens, v4FeeRouter, positionLocker, feeDeployers, v4Deployers } = env;
+    const { tokenFactory, presaleFactory, quickLaunch, treasury, locker, router, hoodsale, metadataRegistry, lens } = env;
+    const { poolManager, positionManager, stateView, weth, v3Router, v3Quoter, rewardsTokenCode, rewardsTokenCodeV4 } = env;
+    const { deployer, alice, bob, carol, dave, marketing } = env;
+
+    const create = async (through, signer, tokenType, spec, cfg) => {
+      const tx = await through.connect(signer).createToken(tokenType, { rewardToken: ethers.ZeroAddress, ...spec }, cfg, signer.address);
+      const receipt = await tx.wait();
+      const created = await through.tokensOfCreator(signer.address);
+      return { address: created[created.length - 1], txHash: tx.hash, blockNumber: receipt.blockNumber };
+    };
+    const standard = await create(feeLauncher, alice, 0, { name: "Fee Standard", symbol: "FEES", totalSupply: E("5555555") }, feeTaxConfig(marketing.address));
+    const tax = await create(feeLauncher, bob, 1, { name: "Fee Tax", symbol: "FEET", totalSupply: E("888000") }, feeTaxConfig(marketing.address, { marketingBps: 300 }));
+    const rewards = await create(
+      feeLauncher, carol, 2, { name: "Fee Yield", symbol: "FEEY", totalSupply: E("1500000"), rewardToken: weth.target },
+      feeTaxConfig(marketing.address, { marketingBps: 100, rewardsBps: 200 })
+    );
+    const hookMode = await create(
+      launcher, dave, 1, { name: "Hook Tax", symbol: "HOOKT", totalSupply: E("640000") },
+      taxConfig(marketing.address, { marketingBuyBps: 300, marketingSellBps: 500 })
+    );
+    const v2Tx = await tokenFactory.connect(alice).createTaxToken("Fee Era Vee Two", "FV2", E("900"), carol.address, 150, 250);
+    await v2Tx.wait();
+    const v2 = { address: await tokenFactory.allTokens((await tokenFactory.allTokensLength()) - 1n), txHash: v2Tx.hash };
+
+    const deployments = {
+      network: "hardhat",
+      router: router.target,
+      treasury: treasury.target,
+      locker: locker.target,
+      tokenFactory: tokenFactory.target,
+      presaleFactory: presaleFactory.target,
+      hoodsale: hoodsale.target,
+      metadataRegistry: metadataRegistry.target,
+      lens: lens.target,
+      quickLaunch: quickLaunch.target,
+      v4Locker: positionLocker.target,
+      v4Launcher: launcher.target,
+      v4Hook: hook.target,
+      v4Lens: v4Lens.target,
+      v4Router: v4Router.target,
+      rewardsTokenCodeV4: rewardsTokenCodeV4.target,
+      v4FeeLauncher: feeLauncher.target,
+      v4FeeHook: feeHook.target,
+      v4FeeLens: v4FeeLens.target,
+      v4FeeRouter: v4FeeRouter.target,
+      v4FeeStandardDeployer: feeDeployers.standardDeployer.target,
+      v4FeeTaxDeployer: feeDeployers.taxDeployer.target,
+      v4FeeRewardsDeployer: feeDeployers.rewardsDeployer.target,
+    };
+    const FEE = [feeLauncher.target, tokenFactory.target];
+    const tokens = {
+      [standard.address]: { contract: FQN.HoodSaleTokenV4, mode: "fee", txHash: standard.txHash, args: ["Fee Standard", "FEES", E("5555555"), ...FEE, 0] },
+      [tax.address]: { contract: FQN.HoodSaleTokenV4, mode: "fee", txHash: tax.txHash, args: ["Fee Tax", "FEET", E("888000"), ...FEE, 1] },
+      [rewards.address]: {
+        contract: FQN.RewardsTokenV4,
+        mode: "fee",
+        txHash: rewards.txHash,
+        args: ["Fee Yield", "FEEY", E("1500000"), ...FEE, weth.target, weth.target, v3Router.target, v3Quoter.target, "0x"],
+      },
+      [hookMode.address]: {
+        contract: FQN.HoodSaleTokenV4,
+        mode: "hook",
+        txHash: hookMode.txHash,
+        args: ["Hook Tax", "HOOKT", E("640000"), launcher.target, tokenFactory.target, 1],
+      },
+      [v2.address]: {
+        contract: FQN.TaxToken,
+        mode: undefined,
+        txHash: v2.txHash,
+        args: ["Fee Era Vee Two", "FV2", E("900"), alice.address, treasury.target, tokenFactory.target, router.target, 25, carol.address, 150, 250],
+      },
+    };
+    // The fee mode contracts, and the instances of the shared lens and router on either side
+    const both = [launcher.target, feeLauncher.target];
+    const platform = [
+      { c: feeLauncher, contract: FQN.V4FeeLauncher, args: [deployer.address, poolManager.target, positionManager.target, PERMIT2, tokenFactory.target, presaleFactory.target, treasury.target] },
+      { c: feeHook, contract: FQN.HoodSaleV4FeeHook, args: [poolManager.target, positionManager.target, feeLauncher.target, treasury.target] },
+      { c: v4FeeLens, contract: FQN.HoodSaleV4Lens, args: [feeLauncher.target, stateView.target] },
+      { c: v4FeeRouter, contract: FQN.HoodSaleV4Router, args: [poolManager.target, feeLauncher.target] },
+      { c: v4Lens, contract: FQN.HoodSaleV4Lens, args: [launcher.target, stateView.target] },
+      { c: v4Router, contract: FQN.HoodSaleV4Router, args: [poolManager.target, launcher.target] },
+      { c: feeDeployers.standardDeployer, contract: FQN.StandardTokenDeployerFee, args: [tokenFactory.target, ...both] },
+      { c: feeDeployers.taxDeployer, contract: FQN.TaxTokenDeployerFee, args: [tokenFactory.target, ...both] },
+      {
+        c: feeDeployers.rewardsDeployer,
+        contract: FQN.RewardsTokenDeployerFee,
+        args: [tokenFactory.target, v3Router.target, v3Quoter.target, rewardsTokenCode.target, rewardsTokenCodeV4.target, ...both],
+      },
+      // The V4 generation the Fee deployers replaced: the factory no longer names it
+      { c: v4Deployers.standardDeployer, contract: FQN.StandardTokenDeployerV4, args: [tokenFactory.target, launcher.target] },
+      { c: v4Deployers.taxDeployer, contract: FQN.TaxTokenDeployerV4, args: [tokenFactory.target, launcher.target] },
+      {
+        c: v4Deployers.rewardsDeployer,
+        contract: FQN.RewardsTokenDeployerV4,
+        args: [tokenFactory.target, v3Router.target, v3Quoter.target, rewardsTokenCode.target, rewardsTokenCodeV4.target, launcher.target],
+      },
+    ];
+    return { ...env, provider: ethers.provider, deployments, tokens, platform, fee: { standard, tax, rewards }, hookMode, v2 };
+  }
+
+  it("rebuilds a fee mode token as the shared v4 contract with the fee launcher as its launcher, and says which launcher made it", async function () {
+    const { provider, deployments, tokens, feeLauncher } = await loadFixture(feeFixture);
+    for (const [address, exp] of Object.entries(tokens)) {
+      const r = await reconstructConstructorArgs(provider, address, { deployments });
+      expect(r.contract, address).to.equal(exp.contract);
+      expect(norm(r.args), `${exp.contract} ${address}`).to.deep.equal(norm(exp.args));
+      expect(r.meta.warnings, address).to.deep.equal([]);
+      expect(r.meta.creation.transactionHash, address).to.equal(exp.txHash);
+      expect(r.meta.launchMode, address).to.equal(exp.mode);
+      if (exp.mode === "fee") expect(r.meta.launcher, address).to.equal(feeLauncher.target);
+    }
+  });
+
+  it("tells the two launchers apart without a deployments file, by the hook each one names", async function () {
+    const { provider, deployments, tokens, fee, feeHook, hook } = await loadFixture(feeFixture);
+    // the fee hook's address carries its two gate bits and nothing else, the tax hook's does not
+    expect(BigInt(feeHook.target) & 0x3fffn).to.equal(BigInt(Miner.FEE_HOOK_FLAGS));
+    expect(BigInt(hook.target) & 0x3fffn).to.equal(BigInt(Miner.HOODSALE_HOOK_FLAGS));
+    for (const [address, exp] of Object.entries(tokens)) {
+      const r = await reconstructConstructorArgs(provider, address, {});
+      expect(r.contract, address).to.equal(exp.contract);
+      expect(norm(r.args), address).to.deep.equal(norm(exp.args));
+      expect(r.meta.launchMode, address).to.equal(exp.mode);
+    }
+    // A deployments file from before fee mode knows one launcher only: the token still comes out
+    // right, with a warning that its launcher is not a listed one
+    const old = { ...deployments };
+    for (const k of Object.keys(old)) if (k.startsWith("v4Fee")) delete old[k];
+    const r = await reconstructConstructorArgs(provider, fee.tax.address, { deployments: old });
+    expect(norm(r.args)).to.deep.equal(norm(tokens[fee.tax.address].args));
+    expect(r.meta.launchMode).to.equal("fee");
+    expect(r.meta.warnings.join(" ")).to.match(/neither v4 launcher in deployments/);
+  });
+
+  it("deploys the artifact again with the reconstructed arguments into the very same fee mode token", async function () {
+    const { provider, deployments, fee, deployer, feeHook } = await loadFixture(feeFixture);
+    for (const t of Object.values(fee)) {
+      const r = await reconstructConstructorArgs(provider, t.address, { deployments });
+      const artifact = await hre.artifacts.readArtifact(r.contract);
+      const copy = await new ethers.ContractFactory(artifact.abi, artifact.bytecode, deployer).deploy(...r.args);
+      await copy.waitForDeployment();
+      // The launcher is an immutable, and so is the hook a Rewards token reads from it: the runtime
+      // code only comes out identical when the launcher argument is the fee launcher
+      expect(await provider.getCode(copy.target), `${r.contract} ${t.address}`).to.equal(await provider.getCode(t.address));
+      if (r.contract === FQN.RewardsTokenV4) expect(await copy.hook()).to.equal(feeHook.target);
+    }
+  });
+
+  it("reconstructs the fee launcher, the fee hook, both lens and router instances and every deployer generation", async function () {
+    const { provider, deployments, platform, feeHook } = await loadFixture(feeFixture);
+    for (const exp of platform) {
+      // from the deployments file, and without one (the factory's slot or the bytecode decides)
+      for (const opts of [{ deployments }, {}]) {
+        const r = await reconstructConstructorArgs(provider, exp.c.target, opts);
+        expect(r.contract, exp.contract).to.equal(exp.contract);
+        expect(norm(r.args), exp.contract).to.deep.equal(norm(exp.args));
+        expect(r.meta.warnings, exp.contract).to.deep.equal([]);
+      }
+      const artifact = await hre.artifacts.readArtifact(exp.contract);
+      const encoded = new ethers.Interface(artifact.abi).encodeDeploy(exp.args);
+      if (exp.c === feeHook) {
+        // The hook went through the CREATE2 proxy: its address is a hash of the creation code with
+        // these very arguments, so mining again from the reconstruction lands on the same address
+        const mined = Miner.mineHookSalt(ethers, artifact.bytecode + encoded.slice(2), Miner.FEE_HOOK_FLAGS, {
+          reject: (address) => address.toLowerCase().startsWith("0x91"),
+        });
+        expect(mined.address).to.equal(feeHook.target);
+      } else {
+        expect(exp.c.deploymentTransaction().data, exp.contract).to.equal(artifact.bytecode + encoded.slice(2));
+      }
+    }
+    // Ownable: the owner argument is the one of the creation's OwnershipTransferred(0, owner) log
+    const launcher = await reconstructConstructorArgs(provider, platform[0].c.target, { deployments });
+    expect(launcher.meta.sources.owner).to.equal("ownership-event");
+    expect(launcher.meta.creation.transactionHash).to.equal(platform[0].c.deploymentTransaction().hash);
+    expect(launcher.kind).to.equal("platform");
+    const deployer = await reconstructConstructorArgs(provider, platform[8].c.target, { deployments });
+    expect(deployer.kind).to.equal("deployer");
+    expect(deployer.meta.sources.feeLauncher).to.equal("immutable-state");
+  });
+
+  it("keeps the deploying owner of the launchers and the locker after ownership is handed on", async function () {
+    const { provider, deployments, deployer, alice, feeLauncher, launcher, positionLocker, poolManager, positionManager, tokenFactory, presaleFactory, treasury } =
+      await loadFixture(feeFixture);
+    const expected = [
+      [feeLauncher, FQN.V4FeeLauncher, [deployer.address, poolManager.target, positionManager.target, PERMIT2, tokenFactory.target, presaleFactory.target, treasury.target]],
+      [launcher, FQN.V4Launcher, [deployer.address, poolManager.target, positionManager.target, PERMIT2, tokenFactory.target, presaleFactory.target, positionLocker.target, treasury.target]],
+      [positionLocker, FQN.V4PositionLocker, [deployer.address, positionManager.target]],
+    ];
+    for (const [c] of expected) await (await c.connect(deployer).transferOwnership(alice.address)).wait();
+
+    for (const [c, contract, args] of expected) {
+      expect(await c.owner(), contract).to.equal(alice.address);
+      const r = await reconstructConstructorArgs(provider, c.target, { deployments });
+      expect(r.contract).to.equal(contract);
+      expect(norm(r.args), contract).to.deep.equal(norm(args));
+      expect(r.meta.sources.owner, contract).to.equal("ownership-event");
+      expect(r.meta.warnings, contract).to.deep.equal([]);
+      // what the explorers are sent: exactly the tail of the deployment transaction
+      const artifact = await hre.artifacts.readArtifact(contract);
+      const encoded = new ethers.Interface(artifact.abi).encodeDeploy(r.args);
+      expect(c.deploymentTransaction().data, contract).to.equal(artifact.bytecode + encoded.slice(2));
+    }
+
+    // When the creation log cannot be found (an RPC that has pruned it answers with no logs), the
+    // current owner is all there is: it is used, and the warning says what that means
+    const blind = new Proxy(provider, {
+      get(target, prop) {
+        if (prop === "getLogs") return async () => [];
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const r = await reconstructConstructorArgs(blind, feeLauncher.target, { deployments });
+    expect(r.args[0]).to.equal(alice.address);
+    expect(r.meta.sources.owner).to.equal("current-owner");
+    expect(r.meta.warnings.join(" ")).to.match(/OwnershipTransferred\(0, owner\) log not found.*wrong if ownership was handed on/);
+  });
+
+  it("verify-platform DRY_RUN lists both v4 modes after the V2 platform, and the Fee deployers under their own keys until the factory names them", async function () {
+    const { deployments, platform, tokenFactory, v4Deployers, feeDeployers } = await loadFixture(feeFixture);
+    const expectedOf = Object.fromEntries(platform.map((p) => [p.c.target, p]));
+    const V2 = ["treasury", "locker", "tokenFactory", "standardDeployer", "taxDeployer", "rewardsDeployer", "rewardsTokenCode", "presaleFactory", "hoodsale", "metadataRegistry", "lens"];
+    const V4 = ["v4Locker", "v4Launcher", "v4Hook", "v4Lens", "v4Router", "rewardsTokenCodeV4", "v4FeeLauncher", "v4FeeHook", "v4FeeLens", "v4FeeRouter"];
+    const check = (results) => {
+      for (const r of results) {
+        expect(r.status, r.label).to.equal(STATUS.DRY_RUN);
+        if (!expectedOf[r.address]) continue;
+        expect(r.contract, r.label).to.equal(expectedOf[r.address].contract);
+        expect(norm(r.plainArgs), r.label).to.deep.equal(norm(expectedOf[r.address].args));
+      }
+    };
+
+    // the factory names the Fee deployers: they are verified once, as the factory's own
+    const wired = await verifyPlatform.run(hre, { dryRun: true, deployments, quiet: true, log: () => {} });
+    expect(wired.map((r) => r.label)).to.deep.equal([...V2, ...V4]);
+    expect(wired[3].address).to.equal(feeDeployers.standardDeployer.target);
+    check(wired);
+
+    // before TokenFactory.setDeployers (and after a rollback) the factory still names the V4
+    // generation, and the Fee deployers are found under their own keys
+    await tokenFactory.setDeployers(v4Deployers.standardDeployer.target, v4Deployers.taxDeployer.target, v4Deployers.rewardsDeployer.target);
+    const lines = [];
+    const before = await verifyPlatform.run(hre, { dryRun: true, deployments, log: (l) => lines.push(l) });
+    expect(before.map((r) => r.label)).to.deep.equal([...V2, ...V4, "v4FeeStandardDeployer", "v4FeeTaxDeployer", "v4FeeRewardsDeployer"]);
+    expect(before[3].address).to.equal(v4Deployers.standardDeployer.target);
+    check(before);
+    expect(lines.join("\n")).to.include("summary: dry-run=24");
+  });
+
+  it("dry-runs a fee mode token and the fee hook with their own sources in the package", async function () {
+    const { deployments, tokens, fee, feeHook, feeLauncher } = await loadFixture(feeFixture);
+    const lines = [];
+    const results = await verifyAddresses(hre, [fee.rewards.address, feeHook.target], { dryRun: true, deployments, quiet: true, log: (l) => lines.push(l) });
+    expect(results.map((r) => r.status)).to.deep.equal([STATUS.DRY_RUN, STATUS.DRY_RUN]);
+    expect(results[0].contract).to.equal(FQN.RewardsTokenV4);
+    expect(norm(results[0].plainArgs)).to.deep.equal(norm(tokens[fee.rewards.address].args));
+    expect(results[0].plainArgs[3]).to.equal(feeLauncher.target);
+    expect(results[1].contract).to.equal(FQN.HoodSaleV4FeeHook);
+    const pkg = await buildVerificationPackage(hre, { address: feeHook.target }, { deployments });
+    const sources = Object.keys(pkg.standardJsonInput.sources);
+    expect(sources).to.include("contracts/v4/fee/HoodSaleV4FeeHook.sol");
+    expect(sources).to.not.include("contracts/v4/HoodSaleV4Hook.sol");
+    expect(lines.join("\n")).to.include(FQN.HoodSaleV4FeeHook);
+  });
+});

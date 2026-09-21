@@ -1,7 +1,8 @@
 // Long-running verification bot: watches the TokenFactory.TokenCreated events (every Standard,
-// Tax and Rewards token, including the tokens QuickLaunch creates through the factory), waits
-// for enough confirmations and verifies every new contract on Sourcify (Blockscout as the
-// secondary target) with retries + exponential backoff. Presale contracts and the platform
+// Tax and Rewards token, including the tokens QuickLaunch creates through the factory and the
+// Uniswap v4 tokens of both launchers, hook mode's V4Launcher and fee mode's V4FeeLauncher, which
+// create through the same factory), waits for enough confirmations and verifies every new
+// contract on Sourcify (Blockscout as the secondary target) with retries + exponential backoff. Presale contracts and the platform
 // contracts are verified as well unless VERIFY_PRESALES=0 (the platform contracts are verified
 // once, by hand, with scripts/verify-contract.js).
 // A single failure never brings the process down. Progress is kept in verify-state/<network>.json.
@@ -159,7 +160,9 @@ function createWatcher(hre, options = {}) {
   async function scan(from, to) {
     let found = 0;
     // Presales are only requested when they are opted in; the token factory's TokenCreated
-    // covers every Standard, Tax and Rewards token, QuickLaunch tokens included.
+    // covers every Standard, Tax and Rewards token, QuickLaunch tokens and the v4 tokens of both
+    // launchers included. A fee mode token is the same contract as a hook mode one and names the
+    // fee launcher, which the reconstruction reads back from the token itself.
     const addresses = cfg.verifyPresales ? [deployments.tokenFactory, deployments.presaleFactory] : [deployments.tokenFactory];
     const topics = cfg.verifyPresales ? [TOPIC.TokenCreated, TOPIC.PresaleCreated] : [TOPIC.TokenCreated];
     for (let start = from; start <= to; start += cfg.logChunk) {

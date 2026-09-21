@@ -5,7 +5,9 @@
 // keeps the rewards deployer under the 24KB limit. TokenFactory itself does not move:
 // setDeployers swaps the deployers, tokens created before keep their old code.
 //
-//   DEPLOYER_KEY=0x... npx hardhat run scripts/deploy-token-deployers.js --network robinhood
+// The key is read without an echo, so it reaches neither the screen nor the shell history:
+//
+//   cd ~/hoodsale/contracts && read -s DEPLOYER_KEY && export DEPLOYER_KEY="$(printf %s "$DEPLOYER_KEY" | tr -d '[:space:]')" && echo "key loaded, ${#DEPLOYER_KEY} characters" && npx hardhat run scripts/deploy-token-deployers.js --network robinhood
 //
 // Optional environment:
 //   STANDARD_DEPLOYER=0x...  reuse an already deployed new StandardTokenDeployer
@@ -14,6 +16,13 @@
 //   REWARDS_DEPLOYER=0x...   reuse an already deployed new RewardsTokenDeployer (must point at
 //                            this deployment's TokenFactory, the chain's V3 router and quoter and
 //                            the RewardsTokenCode above)
+//   REPLACE_V4_DEPLOYERS=1   go on although TokenFactory uses deployers that know a v4 launcher
+//
+// The deployers built here are V2 only. On a platform with a Uniswap v4 mode the factory's
+// deployers also build the plain token a v4 launcher asks for (the V4 generation of
+// scripts/deploy-v4.js, the Fee generation of scripts/deploy-v4-fee.js); replacing them with these
+// would hand every v4 launch a V2 token and make fee mode creation revert NotFeeToken. The script
+// therefore stops before it deploys or sends anything when a live deployer answers launcher().
 //
 // Safe to re-run: the wiring step is skipped when the factory already holds the deployers, and
 // the reuse variables let a run that stopped half way continue without deploying twice. The
@@ -68,6 +77,33 @@ async function main() {
     tokenFactory.rewardsDeployer(),
   ]);
   console.log(`Current deployers: standard ${previousStandard}, tax ${previousTax}, rewards ${previousRewards}`);
+
+  // The V4 and the Fee generation both answer launcher(); only the Fee generation feeLauncher()
+  const answers = async (address, getter) => {
+    if (address === hre.ethers.ZeroAddress) return false;
+    const c = new hre.ethers.Contract(address, [`function ${getter}() view returns (address)`], hre.ethers.provider);
+    try {
+      await c[getter]();
+      return true;
+    } catch (e) {
+      // A deployer without the getter reverts. Anything else (a dropped call) must not pass as a no.
+      if (e.code === "CALL_EXCEPTION" || e.code === "BAD_DATA" || /revert/i.test(String(e.message))) return false;
+      throw e;
+    }
+  };
+  for (const [slot, address] of [["standard", previousStandard], ["tax", previousTax], ["rewards", previousRewards]]) {
+    if (!(await answers(address, "launcher"))) continue;
+    const generation = (await answers(address, "feeLauncher")) ? "Fee generation (scripts/deploy-v4-fee.js)" : "V4 generation (scripts/deploy-v4.js)";
+    if (process.env.REPLACE_V4_DEPLOYERS === "1") {
+      console.log(`WARNING: the ${slot} deployer ${address} is of the ${generation}; going on (REPLACE_V4_DEPLOYERS)`);
+      continue;
+    }
+    throw new Error(
+      `the live ${slot} deployer ${address} is of the ${generation}. This script would replace it with a V2 only deployer: ` +
+        "a v4 launcher would be handed V2 tokens, and fee mode token creation would revert NotFeeToken. " +
+        "Nothing was deployed or sent. REPLACE_V4_DEPLOYERS=1 goes on regardless."
+    );
+  }
 
   const deployOrReuse = async (envKey, name, args) => {
     if (process.env[envKey]) {

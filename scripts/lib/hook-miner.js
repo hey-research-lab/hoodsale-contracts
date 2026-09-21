@@ -33,19 +33,23 @@ const HOODSALE_HOOK_FLAGS =
   HOOK_FLAGS.BEFORE_SWAP_RETURNS_DELTA |
   HOOK_FLAGS.AFTER_SWAP_RETURNS_DELTA;
 
+/** What HoodSaleV4FeeHook's permissions come to: it opens the pool and lets one position in. */
+const FEE_HOOK_FLAGS = HOOK_FLAGS.BEFORE_INITIALIZE | HOOK_FLAGS.BEFORE_ADD_LIQUIDITY;
+
 /**
  * Searches for a salt whose CREATE2 address carries `flags` in its low 14 bits.
+ * `options.reject(address)` skips addresses the caller does not want.
  * @returns {{address: string, salt: string, tried: number}}
  */
 function mineHookSalt(ethers, initcode, flags = HOODSALE_HOOK_FLAGS, options = {}) {
-  const { deployer = CREATE2_PROXY, start = 0n, maxIterations = 2_000_000n } = options;
+  const { deployer = CREATE2_PROXY, start = 0n, maxIterations = 2_000_000n, reject } = options;
   const initcodeHash = ethers.keccak256(initcode);
   const mask = BigInt(ALL_HOOK_MASK);
   const target = BigInt(flags) & mask;
   for (let salt = BigInt(start); salt < BigInt(start) + BigInt(maxIterations); salt++) {
     const saltHex = ethers.toBeHex(salt, 32);
     const address = ethers.getCreate2Address(deployer, saltHex, initcodeHash);
-    if ((BigInt(address) & mask) === target) {
+    if ((BigInt(address) & mask) === target && !(reject && reject(address))) {
       return { address, salt: saltHex, tried: Number(salt - BigInt(start)) + 1 };
     }
   }
@@ -60,6 +64,18 @@ async function hookInitcode(hre, poolManager, launcher, treasury) {
     hre.ethers.AbiCoder.defaultAbiCoder().encode(
       ["address", "address", "address"],
       [poolManager, launcher, treasury]
+    ),
+  ]);
+}
+
+/** Builds HoodSaleV4FeeHook's creation code with its constructor arguments appended. */
+async function feeHookInitcode(hre, poolManager, positionManager, launcher, treasury) {
+  const factory = await hre.ethers.getContractFactory("HoodSaleV4FeeHook");
+  return hre.ethers.concat([
+    factory.bytecode,
+    hre.ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "address", "address", "address"],
+      [poolManager, positionManager, launcher, treasury]
     ),
   ]);
 }
@@ -80,8 +96,10 @@ module.exports = {
   HOOK_FLAGS,
   ALL_HOOK_MASK,
   HOODSALE_HOOK_FLAGS,
+  FEE_HOOK_FLAGS,
   mineHookSalt,
   hookInitcode,
+  feeHookInitcode,
   deployWithCreate2,
   CREATE2_PROXY,
 };

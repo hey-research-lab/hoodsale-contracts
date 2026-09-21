@@ -1,6 +1,6 @@
 // Read-only sanity check of a deployment: prints the wiring between the platform
-// contracts (including QuickLaunch, the quick creation fee and the launch keeper) and the
-// HOODS token state. Usage:
+// contracts (including QuickLaunch, the quick creation fee, the launch keeper and the two
+// Uniswap v4 modes) and the HOODS token state. Usage:
 //   npx hardhat run scripts/check-deployment.js --network robinhood
 const hre = require("hardhat");
 const { describeRewardRoutes } = require("./lib/reward-tokens");
@@ -88,8 +88,10 @@ async function main() {
   }
   // The rewards deployer of the Uniswap V3 generation carries the chain's SwapRouter02 and QuoterV2
   // (the reward swap's V3 leg for the tokenized stocks); an earlier one prints "-" for both. The
-  // address comes from the factory when the deployments file predates scripts/deploy-token-deployers.js.
-  const rewardsDeployerAddr = d.rewardsDeployer || (await tf.rewardsDeployer());
+  // address is the one TokenFactory uses, like the standard and tax deployers below, never the
+  // record's: the two differ after a setDeployers sent by hand (a SKIP_SET_DEPLOYERS run of
+  // scripts/deploy-v4-fee.js, or a rollback), and the report must describe the chain.
+  const rewardsDeployerAddr = out.tokenFactory_rewardsDeployer;
   if (rewardsDeployerAddr && rewardsDeployerAddr !== hre.ethers.ZeroAddress) {
     const rd = await hre.ethers.getContractAt("RewardsTokenDeployer", rewardsDeployerAddr);
     out.rewardsDeployer = rewardsDeployerAddr;
@@ -100,6 +102,14 @@ async function main() {
   }
   out.tokenFactory_standardDeployer = await tf.standardDeployer();
   out.tokenFactory_taxDeployer = await tf.taxDeployer();
+  // A record that names other deployers than the factory uses is stale: say so, per slot
+  for (const slot of ["standard", "tax", "rewards"]) {
+    const recorded = d[`${slot}Deployer`];
+    const used = out[`tokenFactory_${slot}Deployer`];
+    if (recorded && String(recorded).toLowerCase() !== String(used).toLowerCase()) {
+      out[`${slot}Deployer_recordIsStale`] = `record names ${recorded}, TokenFactory uses ${used}`;
+    }
+  }
   // The frontend ABIs come from the current build: a contract on chain that was deployed from
   // an earlier build answers with a different shape (the lens views, for instance) and breaks
   // the pages, so every upgradeable piece is compared with the build byte for byte
@@ -109,16 +119,36 @@ async function main() {
   builds.standardDeployer = out.tokenFactory_standardDeployer;
   builds.taxDeployer = out.tokenFactory_taxDeployer;
   if (out.rewardsDeployer_rewardsTokenCode && out.rewardsDeployer_rewardsTokenCode !== "-") builds.rewardsTokenCode = out.rewardsDeployer_rewardsTokenCode;
+  // The token deployers come in three generations: V2 only, V4 (they also know the hook mode
+  // launcher) and Fee (they know both v4 launchers). Each is compared with the build of its own.
+  const generationOf = async (address) => {
+    const c = new hre.ethers.Contract(
+      address,
+      ["function launcher() view returns (address)", "function feeLauncher() view returns (address)"],
+      p
+    );
+    if (await c.feeLauncher().then(() => true, () => false)) return "Fee";
+    return (await c.launcher().then(() => true, () => false)) ? "V4" : "";
+  };
+  for (const key of ["rewardsDeployer", "standardDeployer", "taxDeployer"]) {
+    if (builds[key]) out[`${key}_generation`] = (await safe(() => generationOf(builds[key]))) || "V2";
+  }
+  const deployerBuild = (key, base) => `${base}${["V4", "Fee"].includes(out[`${key}_generation`]) ? out[`${key}_generation`] : ""}`;
   for (const [key, name] of [
     ["lens", "HoodSaleLens"],
     ["quickLaunch", "QuickLaunch"],
     ["metadataRegistry", "TokenMetadataRegistry"],
     ["presaleFactory", "PresaleFactory"],
     ["presaleCode", "PresaleCode"],
-    ["rewardsDeployer", "RewardsTokenDeployer"],
-    ["standardDeployer", "StandardTokenDeployer"],
-    ["taxDeployer", "TaxTokenDeployer"],
+    ["rewardsDeployer", deployerBuild("rewardsDeployer", "RewardsTokenDeployer")],
+    ["standardDeployer", deployerBuild("standardDeployer", "StandardTokenDeployer")],
+    ["taxDeployer", deployerBuild("taxDeployer", "TaxTokenDeployer")],
     ["rewardsTokenCode", "RewardsTokenCode"],
+    // Fee mode: the site's ABIs for its launcher and hook come from this build as well
+    ["v4FeeLauncher", "V4FeeLauncher"],
+    ["v4FeeHook", "HoodSaleV4FeeHook"],
+    ["v4FeeLens", "HoodSaleV4Lens"],
+    ["v4FeeRouter", "HoodSaleV4Router"],
   ]) {
     if (builds[key]) out[`${key}_matchesBuild`] = await safe(() => matchesBuild(hre, name, builds[key]));
   }
@@ -148,6 +178,62 @@ async function main() {
     out.quickLaunch_rewardTokens = await safe(async () => (await ql.rewardTokens()).join(", "));
     // V3 routes print as "TSLA: token -> WETH -0.3%-> TSLA (V3, pools live)", V2 ones without the fee tiers
     out.quickLaunch_rewardRoutes = await safe(async () => (await describeRewardRoutes(hre, ql)).join(" | "));
+  }
+  // The Uniswap v4 modes. Hook mode (scripts/deploy-v4.js) takes the tax in the pool's hook, fee
+  // mode (scripts/deploy-v4-fee.js) makes it the pool's own fee. Each has its own launcher, hook,
+  // lens and router; both share the keeper wallet and the token deployers.
+  const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+  if (d.v4Launcher) {
+    const launcher = await hre.ethers.getContractAt("V4Launcher", d.v4Launcher);
+    out.v4Launcher_hook = await safe(() => launcher.hook());
+    out.v4Launcher_lens = await safe(() => launcher.lens());
+    out.v4Launcher_keeper = await safe(() => launcher.keeper());
+  }
+  if (d.v4FeeLauncher) {
+    const feeLauncher = await hre.ethers.getContractAt("V4FeeLauncher", d.v4FeeLauncher);
+    out.v4FeeLauncher_owner = await safe(() => feeLauncher.owner());
+    out.v4FeeLauncher_hook = await safe(() => feeLauncher.hook());
+    out.v4FeeLauncher_lens = await safe(() => feeLauncher.lens());
+    out.v4FeeLauncher_keeper = await safe(() => feeLauncher.keeper());
+    // The owner's brake on new fee mode tokens; it never touches a launch
+    out.v4FeeLauncher_creationOpen = await safe(() => feeLauncher.creationOpen());
+    out.v4FeeLauncher_tokens = await safe(async () => (await feeLauncher.tokenCount()).toString());
+    const wiring = [
+      same(out.v4FeeLauncher_hook, d.v4FeeHook),
+      same(out.v4FeeLauncher_lens, d.v4FeeLens),
+      same(out.v4FeeLauncher_keeper, out.v4Launcher_keeper) && !same(out.v4FeeLauncher_keeper, hre.ethers.ZeroAddress),
+    ];
+    if (d.v4FeeHook) {
+      const feeHook = await hre.ethers.getContractAt("HoodSaleV4FeeHook", d.v4FeeHook);
+      // A v4 hook's address carries its permissions: the two gate bits and nothing else
+      const flags = BigInt(d.v4FeeHook) & 0x3fffn;
+      out.v4FeeHook_flags = `0x${flags.toString(16)} (0x2800 expected)`;
+      out.v4FeeHook_launcher = await safe(() => feeHook.launcher());
+      out.v4FeeHook_platformTreasury = await safe(() => feeHook.platformTreasury());
+      out.v4FeeHook_pendingPlatform = await safe(async () => `${hre.ethers.formatEther(await feeHook.pendingPlatform())} ETH`);
+      wiring.push(flags === 0x2800n, same(out.v4FeeHook_launcher, d.v4FeeLauncher), same(out.v4FeeHook_platformTreasury, d.treasury));
+    }
+    if (d.v4FeeLens) {
+      const feeLens = await hre.ethers.getContractAt("HoodSaleV4Lens", d.v4FeeLens);
+      out.v4FeeLens_launcher = await safe(() => feeLens.launcher());
+      out.v4FeeLens_hook = await safe(() => feeLens.hook());
+      wiring.push(same(out.v4FeeLens_launcher, d.v4FeeLauncher), same(out.v4FeeLens_hook, d.v4FeeHook));
+    }
+    if (d.v4FeeRouter) {
+      const feeRouter = await hre.ethers.getContractAt("HoodSaleV4Router", d.v4FeeRouter);
+      out.v4FeeRouter_launcher = await safe(() => feeRouter.launcher());
+      wiring.push(same(out.v4FeeRouter_launcher, d.v4FeeLauncher));
+    }
+    out.v4Fee_wiringMatches = wiring.every(Boolean);
+    // Fee mode tokens come out right only while all three of TokenFactory's deployers name both
+    // launchers (TokenFactory.setDeployers is the last step of scripts/deploy-v4-fee.js, and the
+    // rollback); otherwise V4FeeLauncher.createToken reverts NotFeeToken.
+    const knowsBoth = async (address) => {
+      const c = await hre.ethers.getContractAt("StandardTokenDeployerFee", address);
+      return same(await c.feeLauncher(), d.v4FeeLauncher) && same(await c.launcher(), d.v4Launcher);
+    };
+    const live = [builds.standardDeployer, builds.taxDeployer, builds.rewardsDeployer];
+    out.v4Fee_creationWired = (await Promise.all(live.map((a) => knowsBoth(a).catch(() => false)))).every(Boolean);
   }
   if (deployer) {
     out.deployer = deployer;

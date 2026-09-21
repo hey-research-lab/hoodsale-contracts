@@ -29,6 +29,10 @@ const CONTRACTS = {
   RewardsTokenV4: "contracts/v4/tokens/RewardsTokenV4.sol/RewardsTokenV4.json",
   V4Launcher: "contracts/v4/V4Launcher.sol/V4Launcher.json",
   V4PositionLocker: "contracts/v4/V4PositionLocker.sol/V4PositionLocker.json",
+  // The v4 fee mode: the tax is the pool's fee, and its lens and router are second instances of
+  // HoodSaleV4Lens and HoodSaleV4Router, so they need no ABI of their own
+  HoodSaleV4FeeHook: "contracts/v4/fee/HoodSaleV4FeeHook.sol/HoodSaleV4FeeHook.json",
+  V4FeeLauncher: "contracts/v4/fee/V4FeeLauncher.sol/V4FeeLauncher.json",
 };
 
 function main() {

@@ -7,11 +7,13 @@
 //
 // Recognized contracts:
 //   - TokenFactory tokens (Standard / Tax / Rewards, and the Uniswap v4 HoodSaleTokenV4 /
-//     RewardsTokenV4 the V4Launcher creates through the same factory)
+//     RewardsTokenV4 that the V4Launcher and the V4FeeLauncher create through the same factory)
 //   - Presale contracts (PresaleFactory.isPresale)
-//   - StandardTokenDeployer / TaxTokenDeployer / RewardsTokenDeployer
+//   - StandardTokenDeployer / TaxTokenDeployer / RewardsTokenDeployer, in their three generations
+//     (V2 only, V4 with the hook mode launcher, Fee with both v4 launchers)
 //   - Platform contracts: Treasury, LiquidityLocker, TokenFactory, PresaleFactory,
-//     HoodSaleToken, HoodSaleLens, TokenMetadataRegistry, PresaleCode, QuickLaunch
+//     HoodSaleToken, HoodSaleLens, TokenMetadataRegistry, PresaleCode, QuickLaunch, and the
+//     Uniswap v4 contracts of both modes (launcher, hook, lens, router; hook mode's locker)
 //
 // For mutable constructor values (taxes, marketing wallet, treasury/router/locker on the
 // factories) the ORIGINAL value is looked up in this order:
@@ -44,6 +46,11 @@
 // names are used: HoodSaleTokenV4 (Standard and Tax) and RewardsTokenV4 (Rewards). Every argument
 // but the supply and RewardsTokenV4's V3 path is an immutable and is read back; those two come
 // from the creation receipt the same way (see reconstructTokenV4).
+//
+// Fee mode (the V4FeeLauncher, where the tax is the pool's own fee) reuses those two token
+// contracts byte for byte. Its tokens differ in one argument only, the launcher, which is the fee
+// launcher and is read back like any other immutable; meta.launchMode says which of the two
+// launchers made the token ("hook" or "fee").
 
 const fs = require("fs");
 const path = require("path");
@@ -84,6 +91,13 @@ const FQN = {
   StandardTokenDeployerV4: "contracts/v4/deployers/TokenDeployersV4.sol:StandardTokenDeployerV4",
   TaxTokenDeployerV4: "contracts/v4/deployers/TokenDeployersV4.sol:TaxTokenDeployerV4",
   RewardsTokenDeployerV4: "contracts/v4/deployers/TokenDeployersV4.sol:RewardsTokenDeployerV4",
+  // The Uniswap v4 fee mode. Its lens and router are second instances of HoodSaleV4Lens and
+  // HoodSaleV4Router, and its tokens are HoodSaleTokenV4 and RewardsTokenV4.
+  V4FeeLauncher: "contracts/v4/fee/V4FeeLauncher.sol:V4FeeLauncher",
+  HoodSaleV4FeeHook: "contracts/v4/fee/HoodSaleV4FeeHook.sol:HoodSaleV4FeeHook",
+  StandardTokenDeployerFee: "contracts/v4/deployers/TokenDeployersFee.sol:StandardTokenDeployerFee",
+  TaxTokenDeployerFee: "contracts/v4/deployers/TokenDeployersFee.sol:TaxTokenDeployerFee",
+  RewardsTokenDeployerFee: "contracts/v4/deployers/TokenDeployersFee.sol:RewardsTokenDeployerFee",
 };
 
 // deployments/<network>.json key -> contract name
@@ -105,6 +119,15 @@ const DEPLOYMENT_KEYS = {
   v4Lens: "HoodSaleV4Lens",
   v4Router: "HoodSaleV4Router",
   rewardsTokenCodeV4: "RewardsTokenCodeV4",
+  // Fee mode (scripts/deploy-v4-fee.js). The Fee deployers have keys of their own because they
+  // exist before TokenFactory.setDeployers names them.
+  v4FeeLauncher: "V4FeeLauncher",
+  v4FeeHook: "HoodSaleV4FeeHook",
+  v4FeeLens: "HoodSaleV4Lens",
+  v4FeeRouter: "HoodSaleV4Router",
+  v4FeeStandardDeployer: "StandardTokenDeployerFee",
+  v4FeeTaxDeployer: "TaxTokenDeployerFee",
+  v4FeeRewardsDeployer: "RewardsTokenDeployerFee",
 };
 
 const TOKEN_TYPE_NAMES = ["StandardToken", "TaxToken", "RewardsToken"];
@@ -231,6 +254,8 @@ const DEPLOYER_ABI = [
   // The deployers that can also build a token for a Uniswap v4 pool
   "function launcher() view returns (address)",
   "function rewardsTokenCodeV4() view returns (address)",
+  // The Fee generation, which knows the fee mode launcher next to the hook mode one
+  "function feeLauncher() view returns (address)",
 ];
 
 // Constructor signatures of the token deployers. The rewards deployer of the Uniswap V3
@@ -243,7 +268,16 @@ const DEPLOYER_CONSTRUCTORS = {
   StandardTokenDeployerV4: ["address", "address"],
   TaxTokenDeployerV4: ["address", "address"],
   RewardsTokenDeployerV4: ["address", "address", "address", "address", "address", "address"],
+  // The Fee generation names both v4 launchers: the hook mode one, then the fee mode one
+  StandardTokenDeployerFee: ["address", "address", "address"],
+  TaxTokenDeployerFee: ["address", "address", "address"],
+  RewardsTokenDeployerFee: ["address", "address", "address", "address", "address", "address", "address"],
 };
+
+/** "StandardTokenDeployer", "...V4" and "...Fee" are all token deployers. */
+function isDeployerName(name) {
+  return Object.prototype.hasOwnProperty.call(DEPLOYER_CONSTRUCTORS, name);
+}
 
 const TREASURY_ABI = ["function owner() view returns (address)", OWNABLE_EVENT];
 
@@ -298,6 +332,8 @@ const PLATFORM_CONSTRUCTORS = {
   HoodSaleV4Lens: ["address", "address"],
   HoodSaleV4Router: ["address", "address"],
   RewardsTokenCodeV4: [],
+  HoodSaleV4FeeHook: ["address", "address", "address", "address"],
+  V4FeeLauncher: ["address", "address", "address", "address", "address", "address", "address"],
 };
 
 const V4_HOOK_ABI = [
@@ -315,6 +351,16 @@ const V4_LAUNCHER_ABI = [
   "function locker() view returns (address)",
   "function treasury() view returns (address)",
 ];
+// HoodSaleV4FeeHook and V4FeeLauncher: the hook also holds the PositionManager (it keeps the launch
+// position), and the launcher has no locker argument (its locker() is a constant zero)
+const V4_FEE_HOOK_ABI = [...V4_HOOK_ABI, "function positionManager() view returns (address)"];
+const V4_FEE_LAUNCHER_ABI = V4_LAUNCHER_ABI.filter((f) => !f.startsWith("function locker()"));
+// What tells the two launchers apart on chain: the hook each one names
+const V4_ANY_LAUNCHER_ABI = ["function hook() view returns (address)"];
+// HoodSaleV4FeeHook's permission bits (BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY), which a Uniswap
+// v4 hook carries in the low 14 bits of its address (see scripts/lib/hook-miner.js)
+const FEE_HOOK_FLAGS = 0x2800n;
+const ALL_HOOK_MASK = 0x3fffn;
 const V4_LOCKER_ABI = ["function owner() view returns (address)", "function positionManager() view returns (address)"];
 const V4_LENS_ABI = ["function launcher() view returns (address)", "function stateView() view returns (address)"];
 const V4_ROUTER_ABI = ["function poolManager() view returns (address)", "function launcher() view returns (address)"];
@@ -584,7 +630,7 @@ async function isV4Token(provider, address, code) {
 async function detect(provider, address, code, o) {
   // 1. deployments file
   const known = matchDeployments(address, o.deployments);
-  if (known) return { kind: "platform", name: known };
+  if (known) return { kind: isDeployerName(known) ? "deployer" : "platform", name: known };
 
   // 2. TokenFactory token
   const asToken = new ethers.Contract(address, PLATFORM_TOKEN_ABI, provider);
@@ -593,8 +639,8 @@ async function detect(provider, address, code, o) {
     const factory = new ethers.Contract(tf, TOKEN_FACTORY_ABI, provider);
     const info = await tryCall(() => factory.tokenInfo(address));
     if (info && sameAddr(info.token, address)) {
-      // A token the V4Launcher created is registered with the same token types, but the
-      // deployers built a different contract for it, so it is told apart first
+      // A token the V4Launcher or the V4FeeLauncher created is registered with the same token
+      // types, but the deployers built a different contract for it, so it is told apart first
       if (await isV4Token(provider, address, code)) {
         return { kind: "token", name: V4_TOKEN_TYPE_NAMES[Number(info.tokenType)], tokenFactory: tf, info, poolVersion: 4 };
       }
@@ -617,12 +663,16 @@ async function detect(provider, address, code, o) {
       tryCall(() => tfc.rewardsDeployer()),
     ]);
     // The slot in the factory says which of the three it is; only its own code says which
-    // generation, and the generation that can also build a token for a Uniswap v4 pool is the one
-    // that names a launcher.
-    const isV4 = (await tryCall(() => asWithFactory.launcher())) ? "V4" : "";
-    if (sameAddr(sd, address)) return { kind: "deployer", name: `StandardTokenDeployer${isV4}`, tokenFactory: f };
-    if (sameAddr(td, address)) return { kind: "deployer", name: `TaxTokenDeployer${isV4}`, tokenFactory: f };
-    if (sameAddr(rd, address)) return { kind: "deployer", name: `RewardsTokenDeployer${isV4}`, tokenFactory: f };
+    // generation: the one that can also build a token for a Uniswap v4 pool names a launcher, and
+    // the one that knows fee mode names a fee launcher next to it.
+    const generation = (await tryCall(() => asWithFactory.feeLauncher()))
+      ? "Fee"
+      : (await tryCall(() => asWithFactory.launcher()))
+        ? "V4"
+        : "";
+    if (sameAddr(sd, address)) return { kind: "deployer", name: `StandardTokenDeployer${generation}`, tokenFactory: f };
+    if (sameAddr(td, address)) return { kind: "deployer", name: `TaxTokenDeployer${generation}`, tokenFactory: f };
+    if (sameAddr(rd, address)) return { kind: "deployer", name: `RewardsTokenDeployer${generation}`, tokenFactory: f };
   }
 
   // 4. bytecode match (platform contracts when there is no deployments file)
@@ -649,9 +699,16 @@ async function detect(provider, address, code, o) {
       "V4PositionLocker",
       "HoodSaleV4Lens",
       "HoodSaleV4Router",
+      "StandardTokenDeployerFee",
+      "TaxTokenDeployerFee",
+      "RewardsTokenDeployerFee",
+      "HoodSaleV4FeeHook",
+      "V4FeeLauncher",
     ]);
     if (name) {
-      if (name.endsWith("Deployer")) return { kind: "deployer", name, tokenFactory: f };
+      // A deployer the factory no longer names (a replaced generation) or does not name yet (the
+      // Fee generation before setDeployers) is only found here
+      if (isDeployerName(name)) return { kind: "deployer", name, tokenFactory: f };
       return { kind: "platform", name, viaBytecode: true };
     }
   }
@@ -996,8 +1053,23 @@ async function reconstructToken(provider, address, det, o) {
 // ------------------------------------------------------------ v4 tokens
 
 /**
- * A token the V4Launcher created through the TokenFactory. The dual-mode deployers
- * (contracts/v4/deployers/TokenDeployersV4.sol) build it as
+ * Which of the two v4 launchers `launcher` is: "hook" for the V4Launcher (the tax is taken by the
+ * pool's hook on every swap), "fee" for the V4FeeLauncher (the tax is the pool's own fee), or null
+ * when it cannot be told. The deployments file answers first. Without it the launcher's hook
+ * does: a Uniswap v4 hook carries its permissions in its address, and the fee mode hook's are its
+ * two gate bits and nothing else.
+ */
+async function launchModeOf(provider, launcher, deployments) {
+  if (deployments && deployments.v4FeeLauncher && sameAddr(deployments.v4FeeLauncher, launcher)) return "fee";
+  if (deployments && deployments.v4Launcher && sameAddr(deployments.v4Launcher, launcher)) return "hook";
+  const hook = await tryCall(() => new ethers.Contract(launcher, V4_ANY_LAUNCHER_ABI, provider).hook());
+  if (!hook || hook === ZERO) return null;
+  return (BigInt(hook) & ALL_HOOK_MASK) === FEE_HOOK_FLAGS ? "fee" : "hook";
+}
+
+/**
+ * A token the V4Launcher or the V4FeeLauncher created through the TokenFactory. The deployers that
+ * know them (contracts/v4/deployers/TokenDeployersV4.sol and TokenDeployersFee.sol) build it as
  *   HoodSaleTokenV4(name, symbol, totalSupply, launcher, tokenFactory, tokenType)   Standard, Tax
  *   RewardsTokenV4(name, symbol, totalSupply, launcher, tokenFactory, rewardToken, weth,
  *                  v3Router, v3Quoter, v3Path)                                     Rewards
@@ -1007,6 +1079,7 @@ async function reconstructToken(provider, address, det, o) {
  * reward token at creation, emitting RewardRouteV3Updated) right before that mint. So the creation
  * receipt gives both exactly; the creation-block state and the events are the fallbacks, as for
  * the V2 tokens. The factory calldata is never available: the launcher is the one calling it.
+ * Both modes share the two contracts, so a fee mode token only differs in the launcher it names.
  */
 async function reconstructTokenV4(provider, address, det, o) {
   const warnings = [];
@@ -1026,8 +1099,10 @@ async function reconstructTokenV4(provider, address, det, o) {
   if (!sameAddr(launcher, info.creator)) {
     warnings.push(`the token's launcher ${launcher} is not its creator on the factory (${info.creator})`);
   }
-  if (o.deployments && o.deployments.v4Launcher && !sameAddr(o.deployments.v4Launcher, launcher)) {
-    warnings.push(`token was created by V4Launcher ${launcher}, not the one in deployments`);
+  const launchMode = await launchModeOf(provider, launcher, o.deployments);
+  const listed = o.deployments ? [o.deployments.v4Launcher, o.deployments.v4FeeLauncher].filter(Boolean) : [];
+  if (listed.length > 0 && !listed.some((l) => sameAddr(l, launcher))) {
+    warnings.push(`token was created by launcher ${launcher}, which is neither v4 launcher in deployments`);
   }
 
   const creation = await findTokenCreation(provider, tokenFactory, address, o);
@@ -1154,6 +1229,7 @@ async function reconstructTokenV4(provider, address, det, o) {
       tokenFactory,
       creator: info.creator,
       launcher,
+      launchMode,
       poolVersion: 4,
       creation,
       sources,
@@ -1224,6 +1300,25 @@ async function reconstructDeployer(provider, address, det) {
     args.push(v3Router, v3Quoter, codeV2, codeV4, launcher);
     sources.v3Router = sources.v3Quoter = sources.rewardsTokenCode = "immutable-state";
     sources.rewardsTokenCodeV4 = sources.launcher = "immutable-state";
+  }
+  // The Fee generation: the V4 generation's arguments with the fee mode launcher after them
+  if (det.name === "StandardTokenDeployerFee" || det.name === "TaxTokenDeployerFee") {
+    args.push(...(await Promise.all([c.launcher(), c.feeLauncher()])));
+    sources.launcher = sources.feeLauncher = "immutable-state";
+  }
+  if (det.name === "RewardsTokenDeployerFee") {
+    args.push(
+      ...(await Promise.all([
+        c.v3Router(),
+        c.v3Quoter(),
+        c.rewardsTokenCode(),
+        c.rewardsTokenCodeV4(),
+        c.launcher(),
+        c.feeLauncher(),
+      ]))
+    );
+    sources.v3Router = sources.v3Quoter = sources.rewardsTokenCode = "immutable-state";
+    sources.rewardsTokenCodeV4 = sources.launcher = sources.feeLauncher = "immutable-state";
   }
   if (det.name === "RewardsTokenDeployer") {
     // The Uniswap V3 generation carries the chain's SwapRouter02 and QuoterV2 as immutables
@@ -1338,8 +1433,33 @@ async function reconstructPlatform(provider, address, det, o) {
   }
 
   // The Uniswap v4 contracts. Each one keeps what it was built with, so the arguments come
-  // straight back off the contract; the two that are Ownable report the owner they have now,
-  // which is the one they were deployed with unless it was handed on since.
+  // straight back off the contract. The owner of the three that are Ownable is the exception:
+  // owner() answers with whoever holds the contract now, so the deploying owner is taken from the
+  // OwnershipTransferred(0, owner) log of the creation, like the other Ownable platform contracts.
+  // Only when that log cannot be found is the current owner used, with a warning, because it is
+  // the wrong argument as soon as ownership has been handed on.
+  const deployingOwner = async (currentOwner, what) => {
+    const creation = await findOwnableCreation(provider, address, o);
+    if (!creation) {
+      sources.owner = "current-owner";
+      warnings.push(
+        currentOwner === ZERO
+          ? `OwnershipTransferred(0, owner) log not found and owner() is zero: the ${what} was renounced, so the deploying owner is unknown`
+          : "OwnershipTransferred(0, owner) log not found; owner taken from the current owner(), which is wrong if ownership was handed on since the deployment"
+      );
+      return { owner: currentOwner, creation: null };
+    }
+    sources.owner = "ownership-event";
+    // Deployed from an EOA, so the deployment transaction carries the argument as well
+    if (allowed(o, "creation-tx")) {
+      const tail = await decodeCreationTxTail(provider, address, creation.transactionHash, types, o, name);
+      if (tail && !sameAddr(tail.values[0], creation.owner)) {
+        warnings.push(`the deployment transaction names owner ${tail.values[0]}, the OwnershipTransferred log ${creation.owner}; the log is used`);
+      }
+    }
+    return { owner: creation.owner, creation };
+  };
+
   if (name === "HoodSaleV4Hook") {
     const c = new ethers.Contract(address, V4_HOOK_ABI, provider);
     sources.all = "immutable-state";
@@ -1359,19 +1479,41 @@ async function reconstructPlatform(provider, address, det, o) {
         c.locker(),
         c.treasury(),
       ]);
-    if (owner === ZERO) warnings.push("owner() is zero: the launcher was renounced, so the deploying owner is unknown");
     sources.all = "immutable-state";
-    sources.owner = "current-owner";
-    return finish([owner, poolManager, positionManager, permit2, tokenFactory, presaleFactory, locker, treasury], null);
+    const deployed = await deployingOwner(owner, "launcher");
+    return finish([deployed.owner, poolManager, positionManager, permit2, tokenFactory, presaleFactory, locker, treasury], deployed.creation);
+  }
+
+  // Fee mode: the hook has no owner and also keeps the PositionManager; the launcher is the hook
+  // mode one without a locker.
+  if (name === "HoodSaleV4FeeHook") {
+    const c = new ethers.Contract(address, V4_FEE_HOOK_ABI, provider);
+    sources.all = "immutable-state";
+    return finish(await Promise.all([c.poolManager(), c.positionManager(), c.launcher(), c.platformTreasury()]), null);
+  }
+
+  if (name === "V4FeeLauncher") {
+    const c = new ethers.Contract(address, V4_FEE_LAUNCHER_ABI, provider);
+    const [owner, poolManager, positionManager, permit2, tokenFactory, presaleFactory, treasury] = await Promise.all([
+      c.owner(),
+      c.poolManager(),
+      c.positionManager(),
+      c.permit2(),
+      c.tokenFactory(),
+      c.presaleFactory(),
+      c.treasury(),
+    ]);
+    sources.all = "immutable-state";
+    const deployed = await deployingOwner(owner, "launcher");
+    return finish([deployed.owner, poolManager, positionManager, permit2, tokenFactory, presaleFactory, treasury], deployed.creation);
   }
 
   if (name === "V4PositionLocker") {
     const c = new ethers.Contract(address, V4_LOCKER_ABI, provider);
     const [owner, positionManager] = await Promise.all([c.owner(), c.positionManager()]);
-    if (owner === ZERO) warnings.push("owner() is zero: the locker was renounced, so the deploying owner is unknown");
     sources.all = "immutable-state";
-    sources.owner = "current-owner";
-    return finish([owner, positionManager], null);
+    const deployed = await deployingOwner(owner, "locker");
+    return finish([deployed.owner, positionManager], deployed.creation);
   }
 
   if (name === "HoodSaleV4Lens") {

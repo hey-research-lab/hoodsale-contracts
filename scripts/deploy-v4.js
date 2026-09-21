@@ -3,7 +3,9 @@
 // only wiring this touches is TokenFactory.setDeployers, which swaps in deployers that still build
 // the identical V2 token for every V2 creator.
 //
-//   DEPLOYER_KEY=0x... npx hardhat run scripts/deploy-v4.js --network robinhood
+// The key is read without an echo, so it reaches neither the screen nor the shell history:
+//
+//   cd ~/hoodsale/contracts && read -s DEPLOYER_KEY && export DEPLOYER_KEY="$(printf %s "$DEPLOYER_KEY" | tr -d '[:space:]')" && echo "key loaded, ${#DEPLOYER_KEY} characters" && npx hardhat run scripts/deploy-v4.js --network robinhood
 //
 // Optional environment, to continue a run that stopped half way without deploying twice:
 //   V4_LOCKER=0x...        reuse an already deployed V4PositionLocker
@@ -12,6 +14,12 @@
 //   V4_LENS=0x...          reuse an already deployed HoodSaleV4Lens
 //   V4_ROUTER=0x...        reuse an already deployed HoodSaleV4Router
 //   SKIP_DEPLOYERS=1       leave TokenFactory's deployers alone (v4 token creation stays off)
+//   REPLACE_FEE_DEPLOYERS=1  go on although TokenFactory uses the Fee deployers of fee mode
+//
+// Once fee mode is live (scripts/deploy-v4-fee.js) the factory's deployers know both v4 launchers.
+// The V4 generation built here knows one, so registering it would make every fee mode token
+// creation revert NotFeeToken: without SKIP_DEPLOYERS the script stops before it deploys or sends
+// anything when a live deployer answers feeLauncher().
 //
 // After this, run scripts/upgrade-presale-code.js (so new sales can finalize into a v4 pool) and
 // scripts/deploy-lens.js (so the site's views carry poolKind), then verify everything on the
@@ -26,6 +34,19 @@ const { mineHookSalt, hookInitcode, deployWithCreate2, HOODSALE_HOOK_FLAGS, ALL_
 const { v3For } = require("./lib/reward-tokens");
 
 const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+
+/** Whether `address` is a token deployer of the Fee generation, asked of the chain itself. */
+async function knowsFeeLauncher(address) {
+  const c = new hre.ethers.Contract(address, ["function feeLauncher() view returns (address)"], hre.ethers.provider);
+  try {
+    await c.feeLauncher();
+    return true;
+  } catch (e) {
+    // A deployer without the getter reverts. Anything else (a dropped call) must not pass as a no.
+    if (e.code === "CALL_EXCEPTION" || e.code === "BAD_DATA" || /revert/i.test(String(e.message))) return false;
+    throw e;
+  }
+}
 
 async function main() {
   const [deployer] = await hre.ethers.getSigners();
@@ -65,6 +86,27 @@ async function main() {
   }
   const presaleFactory = await hre.ethers.getContractAt("PresaleFactory", d.presaleFactory);
   const keeper = await presaleFactory.launchKeeper();
+
+  // Checked here, before the locker and the launcher are deployed, so a refusal leaves nothing
+  // behind. With SKIP_DEPLOYERS the factory's deployers are not touched and nothing is asked.
+  if (!process.env.SKIP_DEPLOYERS) {
+    for (const [slot, address] of [
+      ["standard", await tokenFactory.standardDeployer()],
+      ["tax", await tokenFactory.taxDeployer()],
+      ["rewards", await tokenFactory.rewardsDeployer()],
+    ]) {
+      if (!(await knowsFeeLauncher(address))) continue;
+      if (process.env.REPLACE_FEE_DEPLOYERS === "1") {
+        console.log(`WARNING: the ${slot} deployer ${address} is of the Fee generation; going on (REPLACE_FEE_DEPLOYERS)`);
+        continue;
+      }
+      throw new Error(
+        `the live ${slot} deployer ${address} is of the Fee generation (scripts/deploy-v4-fee.js). This script would register ` +
+          "deployers that do not know the fee launcher, and fee mode token creation would revert NotFeeToken. " +
+          "Nothing was deployed or sent. SKIP_DEPLOYERS=1 leaves the deployers alone; REPLACE_FEE_DEPLOYERS=1 goes on regardless."
+      );
+    }
+  }
 
   // ---------------------------------------------------------------- locker
 

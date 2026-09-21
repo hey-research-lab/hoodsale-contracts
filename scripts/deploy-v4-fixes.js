@@ -13,21 +13,42 @@
 //
 // Tokens and sales that already exist keep their own code; only new ones get the fixes.
 //
-//   DEPLOYER_KEY=0x... npx hardhat run scripts/deploy-v4-fixes.js --network robinhood
+// The key is read without an echo, so it reaches neither the screen nor the shell history:
+//
+//   cd ~/hoodsale/contracts && read -s DEPLOYER_KEY && export DEPLOYER_KEY="$(printf %s "$DEPLOYER_KEY" | tr -d '[:space:]')" && echo "key loaded, ${#DEPLOYER_KEY} characters" && npx hardhat run scripts/deploy-v4-fixes.js --network robinhood
 //
 // Optional environment, to continue a run that stopped half way without deploying twice:
 //   REWARDS_CODE_V4=0x...    reuse an already deployed RewardsTokenCodeV4
 //   REWARDS_DEPLOYER=0x...   reuse an already deployed RewardsTokenDeployerV4
 //   PRESALE_CODE=0x...       reuse an already deployed PresaleCode
 //   V4_LENS=0x...            reuse an already deployed HoodSaleV4Lens
+//   REPLACE_FEE_DEPLOYERS=1  go on although TokenFactory uses the Fee deployers (see below)
 //
-// Safe to re-run: every wiring step is skipped when it is already in place. Nothing here prints
-// or stores a private key.
+// Safe to re-run while the factory's deployers are the V4 generation: every wiring step is skipped
+// when it is already in place. Once fee mode is live (scripts/deploy-v4-fee.js) the factory's
+// deployers know both v4 launchers, and the rewards deployer this script builds knows only the
+// hook mode one: swapping it in would make every fee mode Rewards token creation revert
+// NotFeeToken. The script therefore stops before it deploys or sends anything when a live deployer
+// answers feeLauncher(). A new PresaleCode alone is shipped by scripts/upgrade-presale-code.js.
+// Nothing here prints or stores a private key.
 const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 
 const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+
+/** Whether `address` is a token deployer of the Fee generation, asked of the chain itself. */
+async function knowsFeeLauncher(address) {
+  const c = new hre.ethers.Contract(address, ["function feeLauncher() view returns (address)"], hre.ethers.provider);
+  try {
+    await c.feeLauncher();
+    return true;
+  } catch (e) {
+    // A deployer without the getter reverts. Anything else (a dropped call) must not pass as a no.
+    if (e.code === "CALL_EXCEPTION" || e.code === "BAD_DATA" || /revert/i.test(String(e.message))) return false;
+    throw e;
+  }
+}
 
 async function reuseOrDeploy(envName, contractName, args) {
   const addr = process.env[envName];
@@ -74,6 +95,22 @@ async function main() {
     tax: await tokenFactory.taxDeployer(),
     rewards: await tokenFactory.rewardsDeployer(),
   };
+  // A Fee deployer answers every getter read below and names the same hook mode launcher, so
+  // without this it would pass for the V4 generation and be replaced by a deployer that does not
+  // know the fee launcher.
+  for (const [slot, address] of Object.entries(current)) {
+    if (!(await knowsFeeLauncher(address))) continue;
+    if (process.env.REPLACE_FEE_DEPLOYERS === "1") {
+      console.log(`WARNING: the ${slot} deployer ${address} is of the Fee generation; going on (REPLACE_FEE_DEPLOYERS)`);
+      continue;
+    }
+    throw new Error(
+      `the live ${slot} deployer ${address} is of the Fee generation (scripts/deploy-v4-fee.js). This script would swap in a ` +
+        "rewards deployer that does not know the fee launcher, and fee mode Rewards token creation would revert NotFeeToken. " +
+        "Nothing was deployed or sent. A new PresaleCode alone: scripts/upgrade-presale-code.js. " +
+        "REPLACE_FEE_DEPLOYERS=1 goes on regardless."
+    );
+  }
   // Everything the new rewards deployer is built with comes from the one it replaces, so a V2
   // Rewards token and the reward swap's route stay exactly as they are.
   const old = await hre.ethers.getContractAt("RewardsTokenDeployerV4", current.rewards);

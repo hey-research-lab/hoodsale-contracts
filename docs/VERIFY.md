@@ -23,8 +23,9 @@ API directly, the plugin only knows the legacy endpoint.
 | `scripts/lib/sourcify.js` | Sourcify v2 client on the global `fetch`: `submitStandardJson`, `pollJob`, `getContractStatus`, `verifyStandardJson` (the three in one), `supportsChain`, `repoUrl`. Errors are `SourcifyError { code, httpStatus, customCode, retryable }`; "already verified" answers are success. |
 | `scripts/verify-standard-json.js` | Builds the verification package (Standard JSON Input taken from the Hardhat build-info, compiler version, ABI encoded constructor args); the same package is what Sourcify receives and what `verify-out/<network>/` gets for a manual upload. Also a CLI. |
 | `scripts/verify-contract.js` | Verifies one or more addresses (`ADDRESSES=` env). Shared core (`verifyOne`: Sourcify first, Blockscout second; `verifyAddresses`, Cloudflare detection, summary table) used by the two scripts below. |
-| `scripts/verify-platform.js` | Verifies every contract in `deployments/<network>.json` plus the three token deployers read from `TokenFactory`. Run it after a platform deployment; the platform contracts are published and verified (see the Trust page of the site). |
-| `scripts/auto-verify.js` | Long running watcher: follows `TokenCreated` (and `PresaleCreated` with `VERIFY_PRESALES=1`), waits for confirmations, verifies with retries and exponential backoff, persists a cursor in `verify-state/<network>.json`. `scripts/launch-keeper.js` runs it in the keeper process unless `AUTO_VERIFY=0`. |
+| `scripts/verify-platform.js` | Verifies every contract in `deployments/<network>.json` plus the three token deployers read from `TokenFactory`, then the Uniswap v4 contracts of both modes for the keys the file has (hook mode: `v4Locker`, `v4Launcher`, `v4Hook`, `v4Lens`, `v4Router`, `rewardsTokenCodeV4`; fee mode: `v4FeeLauncher`, `v4FeeHook`, `v4FeeLens`, `v4FeeRouter` and the three `v4Fee*Deployer` keys while the factory does not name them yet). Run it after a platform deployment; the platform contracts are published and verified (see the Trust page of the site). |
+| `scripts/check-deployment.js` | Read-only wiring report. For verification it says which generation each token deployer is (`V2`, `V4`, `Fee`), whether every replaceable contract and the fee mode contracts match the current build, and whether fee mode is wired (`v4Fee_wiringMatches`, `v4Fee_creationWired`). All three deployers are the ones TokenFactory uses, never the record's; a record that names another one gets a `<slot>Deployer_recordIsStale` line (after a `setDeployers` sent by hand, or a rollback). |
+| `scripts/auto-verify.js` | Long running watcher: follows `TokenCreated` (and `PresaleCreated` with `VERIFY_PRESALES=1`), waits for confirmations, verifies with retries and exponential backoff, persists a cursor in `verify-state/<network>.json`. Tokens of both v4 launchers come through the same event. `scripts/launch-keeper.js` runs it in the keeper process unless `AUTO_VERIFY=0`. |
 | `test/verify-args.test.js`, `test/auto-verify.test.js` | Offline tests for all of the above (in-process Hardhat network, `MockDex`, a mocked Sourcify server on a random port). |
 
 `verify-state/` and `verify-out/` carry their own `.gitignore` (`*`, `!.gitignore`), the
@@ -34,8 +35,10 @@ scripts recreate it if the folder is missing, so nothing generated is ever commi
 
 ```bash
 # 1. the keeper: launches, deliveries and the verification of every factory token in one process
-KEEPER_KEY=0x... npm run keeper -- --network robinhood
-AUTO_VERIFY=0 KEEPER_KEY=0x... npm run keeper -- --network robinhood      # without verification
+#    (it signs with KEEPER_KEY, which it takes from the environment: on the server from the
+#    service's environment file, never typed in front of the command)
+npm run keeper -- --network robinhood
+AUTO_VERIFY=0 npm run keeper -- --network robinhood      # without verification
 
 # 2. the watcher on its own (same behaviour, no transactions)
 npm run auto-verify -- --network robinhood
@@ -44,7 +47,7 @@ VERIFY_PRESALES=0 npm run auto-verify -- --network robinhood              # toke
 # 3. arbitrary addresses (tokens, presales, deployers, platform contracts)
 ADDRESSES=0xTOKEN,0xPRESALE npx hardhat run scripts/verify-contract.js --network robinhood
 
-# 4. platform contracts (after every deployment or replacement)
+# 4. platform contracts (after every deployment or replacement, scripts/deploy-v4-fee.js included)
 npx hardhat run scripts/verify-platform.js --network robinhood
 
 # 5. manual packages only, no API call at all
@@ -54,6 +57,17 @@ ADDRESSES=0xTOKEN npx hardhat run scripts/verify-standard-json.js --network robi
 # offline tests
 npx hardhat test test/verify-args.test.js test/auto-verify.test.js
 ```
+
+None of the verification commands signs anything, so none needs a key. A command that does (the
+deploy scripts) reads it without an echo, so it reaches neither the screen nor the shell history:
+
+```bash
+cd ~/hoodsale/contracts && read -s DEPLOYER_KEY && export DEPLOYER_KEY="$(printf %s "$DEPLOYER_KEY" | tr -d '[:space:]')" && echo "key loaded, ${#DEPLOYER_KEY} characters" && <command>
+```
+
+Never type `DEPLOYER_KEY=0x...` in front of a command. Where verification sits in the fee mode
+release (after the deployment, before `TokenFactory.setDeployers` and before the site release) is
+laid out step by step in `docs/FEE-MODE-RELEASE.md`.
 
 Environment variables understood by the scripts:
 
@@ -124,13 +138,22 @@ It is harmless, Blockscout does not support the Etherscan v2 endpoint anyway.
 Detection order in `reconstructConstructorArgs`:
 
 1. address listed in the deployments json (`treasury`, `locker`, `tokenFactory`,
-   `presaleFactory`, `hoodsale`, `metadataRegistry`, `lens`);
+   `presaleFactory`, `hoodsale`, `metadataRegistry`, `lens`, the hook mode keys `v4Hook`,
+   `v4Launcher`, `v4Locker`, `v4Lens`, `v4Router`, `rewardsTokenCodeV4`, and the fee mode keys
+   `v4FeeLauncher`, `v4FeeHook`, `v4FeeLens`, `v4FeeRouter`, `v4FeeStandardDeployer`,
+   `v4FeeTaxDeployer`, `v4FeeRewardsDeployer`; two keys may name the same contract, as the two
+   lens and the two router instances do);
 2. platform token: the address answers `tokenFactory()` and that factory's
    `tokenInfo(address).token == address`; type from `tokenType`;
 3. `factory()` answers: `PresaleFactory.isPresale(address)` (Presale) or
-   `TokenFactory.standardDeployer()/taxDeployer()/rewardsDeployer() == address` (deployer);
+   `TokenFactory.standardDeployer()/taxDeployer()/rewardsDeployer() == address` (deployer).
+   The slot says which of the three it is, its own getters say which generation:
+   `feeLauncher()` answers for the Fee generation, `launcher()` alone for the V4 generation,
+   neither for the V2 one;
 4. deployed bytecode compared with the local artifacts (metadata hash and immutable
-   slots masked), used when no deployments json is available;
+   slots masked), used when no deployments json is available. This is also how a deployer is
+   found that the factory does not name: a replaced generation, or the Fee deployers between
+   their deployment and `TokenFactory.setDeployers`;
 5. otherwise `UNRECOGNIZED` (EOAs give `NO_CODE`).
 
 Immutable values are read from the contract (`platformTreasury`, `tokenFactory`,
@@ -185,6 +208,46 @@ the platform's QuickLaunch stored for the reward when the token was created; emp
 from the `RewardRouteV3Updated` log of the creation receipt, so a route the owner set later
 does not matter. The same fallbacks as above apply when the receipt cannot be read.
 
+A fee mode token (created through the V4FeeLauncher, where the tax is the pool's own fee) is the
+same `HoodSaleTokenV4` or `RewardsTokenV4`, byte for byte. Only its `launcher` argument differs:
+it is the fee launcher, read back from the token like every other immutable, so nothing else
+changes and the watcher needs no setting for it. `meta.launchMode` says which launcher made the
+token: `"fee"` or `"hook"` by the `v4FeeLauncher` and `v4Launcher` keys of the deployments json,
+and without them by the hook the launcher names, since a Uniswap v4 hook carries its
+permissions in the low 14 bits of its address and only the fee hook's are exactly `0x2800`. A
+launcher that is neither key of a deployments json that has one produces a warning, not an error.
+
+### Fee mode platform contracts
+
+`scripts/deploy-v4-fee.js` deploys them and records them under the keys above. Every argument is
+an immutable and is read back, except the launcher's owner: the launcher is Ownable and `owner()`
+answers with whoever holds it now, so the deploying owner is taken from the
+`OwnershipTransferred(0, owner)` log of its creation (`meta.sources.owner = "ownership-event"`,
+and `meta.creation` carries the deployment transaction, which Sourcify is given). The explorers
+are sent these arguments, so they stay right after ownership has moved to a multisig or a
+timelock. Only when that log cannot be found is the current owner used
+(`meta.sources.owner = "current-owner"`), with a warning that it is wrong if ownership was handed
+on. `V4Launcher` and `V4PositionLocker` are reconstructed the same way.
+
+- `V4FeeLauncher(owner, poolManager, positionManager, permit2, tokenFactory, presaleFactory, treasury)`
+  (the hook mode launcher without its locker argument)
+- `HoodSaleV4FeeHook(poolManager, positionManager, launcher, platformTreasury)`. It is deployed
+  through the CREATE2 proxy at a mined address, so it has no deployment transaction of its own;
+  the salt is kept as `v4FeeHookSalt`, and mining again from the artifact's creation code plus
+  the reconstructed arguments lands on the same address (the tests do exactly that).
+- `HoodSaleV4Lens(feeLauncher, stateView)` and `HoodSaleV4Router(poolManager, feeLauncher)`: second
+  instances of the hook mode contracts, under `v4FeeLens` and `v4FeeRouter`
+- `StandardTokenDeployerFee(factory, launcher, feeLauncher)`,
+  `TaxTokenDeployerFee(factory, launcher, feeLauncher)` and
+  `RewardsTokenDeployerFee(factory, v3Router, v3Quoter, rewardsTokenCode, rewardsTokenCodeV4, launcher, feeLauncher)`,
+  where `launcher` is the hook mode V4Launcher. RewardsTokenCode and RewardsTokenCodeV4 are the
+  holders already on chain; fee mode deploys no new one.
+
+`verify-platform.js` lists the Fee deployers once: as `standardDeployer`, `taxDeployer` and
+`rewardsDeployer` when TokenFactory names them, under their `v4Fee*Deployer` keys before that
+(a run with `SKIP_SET_DEPLOYERS=1`) and after a rollback. The V4 generation they replace stays
+verifiable by address, found by its bytecode.
+
 ### Presales from an earlier `Presale.sol`
 
 `verify-contract.js` and the watcher build every submission from the current build. A presale
@@ -233,8 +296,11 @@ verification out). The standalone form is the same watcher without the keeper:
 
 ```bash
 cd contracts
-KEEPER_KEY=0x... CONFIRMATIONS=12 START_BLOCK=<platform deploy block> npm run keeper -- --network robinhood
-DEPLOYER_KEY=... CONFIRMATIONS=12 POLL_INTERVAL_MS=15000 START_BLOCK=<platform deploy block> \
+# the keeper signs: KEEPER_KEY comes from the service's environment file (keeper/keeper.env.example),
+# never from the command line
+CONFIRMATIONS=12 START_BLOCK=<platform deploy block> npm run keeper -- --network robinhood
+# the watcher alone signs nothing and needs no key
+CONFIRMATIONS=12 POLL_INTERVAL_MS=15000 START_BLOCK=<platform deploy block> \
   npm run auto-verify -- --network robinhood
 ```
 
@@ -263,12 +329,11 @@ Behaviour:
 
 A systemd unit only needs `WorkingDirectory=/path/to/contracts`, the environment
 variables above, `Restart=always` and `ExecStart=/usr/bin/npm run keeper -- --network
-robinhood`. For the standalone watcher `DEPLOYER_KEY` must be set for the network entry to
-exist, the watcher never sends transactions.
+robinhood`. The standalone watcher needs no key: it never sends transactions.
 
 ## What is proven offline
 
-`npx hardhat test test/verify-args.test.js` (34 tests) deploys the
+`npx hardhat test test/verify-args.test.js` (41 tests) deploys the
 platform with `MockDex`, creates one token of each type with distinctive parameters and a
 whitelisted presale with `launchTime`, then lets the owners call `setTaxes`,
 `setMarketingWallet`, `setRouter`, `setTreasury`, `setLocker` and `transferOwnership`,
@@ -285,9 +350,29 @@ against a local HTTP server, error classification, the `DRY_RUN` output of
 watcher (cursor, confirmations, persistence and resume, backoff and give-up). On the v4
 platform fixture it also builds a v4 Standard, a v4 Tax and two v4 Rewards tokens (one paying
 WETH, one paying a stock along a V3 route its owner changed later) and proves the rebuilt
-arguments reproduce each deployment, with V2 tokens from the same deployers as controls.
+arguments reproduce each deployment, with V2 tokens from the same deployers as controls. On
+the fixture with both v4 modes it creates a fee mode Standard, Tax and Rewards token next to a
+hook mode and a V2 token from the same Fee deployers and proves: the fee launcher as the
+launcher argument and `meta.launchMode` with and without a deployments json, a redeployment
+from the reconstructed arguments giving the identical runtime code, the arguments of the fee
+launcher, the fee hook (mined again to its own address), both lens and router instances, the
+Fee deployers and the replaced V4 generation against their deployment transactions, the
+deploying owner of both launchers and the locker after `transferOwnership` (and the warned
+fallback to the current owner when the creation log cannot be found), and the
+`verify-platform.js` list before and after `TokenFactory.setDeployers`.
 
-`npx hardhat test test/auto-verify.test.js` (18 tests) starts a Sourcify look-alike on a
+`npx hardhat test test/v4fee/deploy-script.test.js` (13 tests) runs `scripts/deploy-v4-fee.js`
+itself in-process on the hook mode fixture: the `SKIP_SET_DEPLOYERS` run (ten transactions, the
+factory untouched, the rollback target recorded), the run after it (one transaction) and the
+rerun (none), `setDeployers` sent by hand in between, a record left by an earlier version of the
+script, a factory that names a mix of generations (never recorded as the rollback target), the
+refusal of `SKIP_DEPLOYERS`, swapped deployer overrides stopped before `setDeployers`
+by the simulated creations, every override reused and written down only after the wiring check, a
+recorded address without code, the creation brake (`CLOSE_CREATION`, `OPEN_CREATION`), a dropped
+read tried again, a failing check reported with its reason and the state of the run, and a run
+that dies at any of its eleven transactions and is started again.
+
+`npx hardhat test test/auto-verify.test.js` (19 tests) starts a Sourcify look-alike on a
 random port (`SOURCIFY_URL` points at it), creates a Standard, a Tax and a Rewards token
 through the factory plus a QuickLaunch token and a normal presale, and checks: the client
 (202 + job polling, 409 and 404 handling, 500 retryable / 400 final, failed jobs,
@@ -297,8 +382,9 @@ verified as success; a 500 stays retryable without a manual package; `SOURCIFY=0
 the old behaviour; `DRY_RUN` prints the request), the QuickLaunch token (exact constructor
 args from the creation receipt, verified with the launch transaction as creation tx), and
 the watcher (all four tokens and both presales verified by default, `VERIFY_PRESALES=0`
-skipping the presales, backoff after a 500 and success on the next attempt, `ONCE`
-mode, the keeper integration and `AUTO_VERIFY=0`).
+skipping the presales, v4 tokens of hook mode and of fee mode submitted under the v4 contract
+they share, backoff after a 500 and success on the next attempt, `ONCE` mode, the keeper
+integration and `AUTO_VERIFY=0`).
 
 Not proven offline: a real Sourcify round trip (the platform token was verified by hand
 with `exact_match` through the same v2 calls on 2026-09-05), an actual `verify:verify`

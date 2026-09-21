@@ -765,9 +765,11 @@ function forkSuite() {
       return w;
     }
 
+    // The creator takes no share of a quick raise (QuickLaunch.MAX_CREATOR_SHARE_PERCENT is 0); the
+    // field stays in the ABI and anything above zero is refused with "share too high".
     function quickRewardsParams(name, symbol, rewardToken) {
       return {
-        name, symbol, hardCap: E("1"), durationOption: 0, creatorSharePercent: 5,
+        name, symbol, hardCap: E("1"), durationOption: 0, creatorSharePercent: 0,
         tokenType: 2, rewardToken, taxWallet: ZERO, buyTaxBps: 100, sellTaxBps: 100,
         rewardsBuyBps: 300, rewardsSellBps: 300, logoURI: "", description: "",
       };
@@ -1155,10 +1157,20 @@ function forkSuite() {
       expect((lpAmount * BPS) / ts1).to.be.gt(9500n);
     });
 
-    it("the presale accepts plain ETH (receive) although the real router never refunds on the empty-pair path", async function () {
-      const { presale, carol } = await loadFixture(readyFixture);
-      await expect(carol.sendTransaction({ to: presale.target, value: E("0.001") })).to.not.be.reverted;
-      expect(await ethers.provider.getBalance(presale.target)).to.equal(E("6.001"));
+    // A plain transfer is a contribution on the same terms as contribute(), so a stray one to a
+    // sale that has ended reverts instead of being swallowed. Only the router and the v4 launcher
+    // may send ETH without contributing, and the real router never refunds on the empty-pair path,
+    // so the launch does not lean on that exception here.
+    it("the presale refuses a stray ETH transfer once the sale has ended, and still launches through the real router", async function () {
+      const { presale, alice, carol } = await loadFixture(readyFixture);
+      await expect(carol.sendTransaction({ to: presale.target, value: E("0.001") })).to.be.revertedWith("ended");
+      expect(await ethers.provider.getBalance(presale.target)).to.equal(E("6"));
+      expect(await presale.totalRaised()).to.equal(E("6"));
+
+      await expect(presale.connect(alice).finalize(0, 0))
+        .to.emit(presale, "Finalized")
+        .withArgs(E("0.6"), E("3.24"), E("129600"), anyValue);
+      expect(await presale.status()).to.equal(Finalized);
     });
   });
 }

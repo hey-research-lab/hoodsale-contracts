@@ -1,0 +1,51 @@
+{
+  "chainId": 4663,
+  "openedAt": "2026-09-20T18:03:17.590Z",
+  "token": "0x9FF3b1a013bEB15bfdcF890a3377B5305133e9d1",
+  "launcher": "0x4eCf6C41c9462008fE1F2402877EF14c791711a7",
+  "hook": "0x889f1BabEF97096F3D638cBc670b851c314c2800",
+  "hookSalt": "0x0000000000000000000000000000000000000000000000000000000000001b94",
+  "poolId": "0xf42ef2898f6f5cc2e46d8364b0e9e723db9c8b2b1c4a2abbaa45245f8b6b2cd8",
+  "tokenId": "3007913",
+  "feePips": 32500,
+  "marketingBps": 200,
+  "rewardsBps": 100,
+  "eth": "0.004",
+  "tokens": "500000.0",
+  "launchTx": "0x19b0f0c17515612d79db1bde6f75840f29fd6fed08e3ddef20ec21fe02b730b2",
+  "proof": {
+    "date": "2026-09-21",
+    "uniswapAppQuoted": "about 12 minutes after launch, both directions, fee applied exactly (0.00105 ETH -> 101,266 FEEHOOK; 183,944 FEEHOOK -> 0.00105 ETH)",
+    "uniswapAppBuy": "0.0005 ETH -> 53,944.80 FEEHOOK, executed through the Uniswap app",
+    "uniswapAppSell": "20,000 FEEHOOK sold through the Uniswap app",
+    "feesWaiting": {
+      "eth": "0.000016249999999999",
+      "tokens": "649.999999999999999999"
+    },
+    "collectTx": "0x5bcff8b505b9c807ac7679a28c6e22cf4ce76d6e05517a4a1511ebe9ed21656b",
+    "collectGas": 279523,
+    "convertTx": "0x04aae267e39a002bb3aa1246b7c640d69d7a767ec72fe05c9d0c8a6fe2e7778e",
+    "convertGas": 187353,
+    "converted": {
+      "tokens": "649.999999999999999999",
+      "eth": "0.000005798897385123"
+    },
+    "booked": {
+      "marketing": "0.000013568552236997",
+      "rewards": "0.000006784276118498",
+      "platform": "0.000001696069029627"
+    },
+    "flushTx": "0xd94b39afb530fe034a352f24bf76f00b33a702a6836467808e044cdd2488beb6",
+    "flushPlatformTx": "0x266de9f1fb0cf3da44a2c936d43267e6b1b90b7ab487f5c5ad2224e73275f76c",
+    "positionAfter": {
+      "tokenId": "3007913",
+      "liquidity": "44721359549995793928",
+      "owner": "the hook"
+    },
+    "trackers": {
+      "geckoTerminal": "indexed within 2 minutes",
+      "dexScreener": "not indexed when checked"
+    },
+    "note": "The Uniswap app labels this throwaway test token as malicious (Blockaid); the hookless test token FEETEST carries the same label, so the label does not come from the hook. To be re-checked with a verified platform token at the rehearsal sale."
+  }
+}

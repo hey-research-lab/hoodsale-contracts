@@ -283,3 +283,128 @@ function keyArray(key) {
 }
 
 module.exports.keyArray = keyArray;
+
+// ------------------------------------------------- the whole platform, with both v4 modes
+
+/**
+ * Deploys HoodSaleV4FeeHook at an address carrying its two gate bits, through the same miner the
+ * deploy script uses, skipping the addresses that script skips.
+ */
+async function deployFeeHook(signer, poolManager, positionManager, launcher, treasury) {
+  const hre = require("hardhat");
+  const factory = await ethers.getContractFactory("HoodSaleV4FeeHook");
+  const initcode = await Miner.feeHookInitcode(hre, poolManager, positionManager, launcher, treasury);
+  const mined = Miner.mineHookSalt(ethers, initcode, Miner.FEE_HOOK_FLAGS, {
+    reject: (address) => address.toLowerCase().startsWith("0x91"),
+  });
+  await Miner.deployWithCreate2(hre, signer, initcode, mined.salt, mined.address);
+  return { hook: factory.attach(mined.address), address: mined.address, salt: mined.salt };
+}
+
+/**
+ * Everything deployPlatformV4 builds, plus fee mode beside it, wired in the order the deploy
+ * script follows: the fee launcher, its hook at a mined address, a second instance of the
+ * unchanged v4 lens and v4 router, the deployers that know both launchers, and TokenFactory's
+ * setDeployers as the very last step. Hook mode and V2 keep working through the same factory.
+ */
+async function deployPlatformV4Fee() {
+  const ctx = await deployPlatformV4();
+  const { deployer, tokenFactory, presaleFactory, treasury, v3Router, v3Quoter, keeper } = ctx;
+
+  const feeLauncher = await ethers.deployContract("V4FeeLauncher", [
+    deployer.address,
+    ctx.poolManager.target,
+    ctx.positionManager.target,
+    PERMIT2,
+    tokenFactory.target,
+    presaleFactory.target,
+    treasury.target,
+  ]);
+  const { hook: feeHook } = await deployFeeHook(
+    deployer,
+    ctx.poolManager.target,
+    ctx.positionManager.target,
+    feeLauncher.target,
+    treasury.target
+  );
+  await feeLauncher.setHook(feeHook.target);
+  await feeLauncher.setKeeper(keeper.address);
+
+  // The same lens and router contracts as hook mode; each instance reads one launcher. The lens
+  // takes the hook from the launcher, so it comes after setHook.
+  const v4FeeLens = await ethers.deployContract("HoodSaleV4Lens", [feeLauncher.target, ctx.stateView.target]);
+  await feeLauncher.setLens(v4FeeLens.target);
+  const v4FeeRouter = await ethers.deployContract("HoodSaleV4Router", [ctx.poolManager.target, feeLauncher.target]);
+
+  const standardDeployer = await ethers.deployContract("StandardTokenDeployerFee", [
+    tokenFactory.target,
+    ctx.launcher.target,
+    feeLauncher.target,
+  ]);
+  const taxDeployer = await ethers.deployContract("TaxTokenDeployerFee", [
+    tokenFactory.target,
+    ctx.launcher.target,
+    feeLauncher.target,
+  ]);
+  const rewardsDeployer = await ethers.deployContract("RewardsTokenDeployerFee", [
+    tokenFactory.target,
+    v3Router.target,
+    v3Quoter.target,
+    ctx.rewardsTokenCode.target,
+    ctx.rewardsTokenCodeV4.target,
+    ctx.launcher.target,
+    feeLauncher.target,
+  ]);
+  await tokenFactory.setDeployers(standardDeployer.target, taxDeployer.target, rewardsDeployer.target);
+
+  return {
+    ...ctx,
+    feeLauncher,
+    feeHook,
+    v4FeeLens,
+    v4FeeRouter,
+    feeDeployers: { standardDeployer, taxDeployer, rewardsDeployer },
+  };
+}
+
+/** The tax a fee mode launch is created with: one rate per share, fixed for good. */
+function feeTaxConfig(marketingWallet, { marketingBps = 0, rewardsBps = 0, walletLocked = false } = {}) {
+  return taxConfig(marketingWallet, {
+    marketingBuyBps: marketingBps,
+    marketingSellBps: marketingBps,
+    rewardsBuyBps: rewardsBps,
+    rewardsSellBps: rewardsBps,
+    taxLocked: true,
+    walletLocked,
+  });
+}
+
+module.exports.FEE_HOOK_FLAGS = Miner.FEE_HOOK_FLAGS;
+module.exports.deployFeeHook = deployFeeHook;
+module.exports.deployPlatformV4Fee = deployPlatformV4Fee;
+module.exports.feeTaxConfig = feeTaxConfig;
+
+// ------------------------------------------------------------ Uniswap's routing rule
+
+/** The fee value that marks a v4 pool's fee as dynamic (v4-core LPFeeLibrary.DYNAMIC_FEE_FLAG). */
+const DYNAMIC_FEE_FLAG = 0x800000;
+/** The highest static fee Uniswap's router still routes, in pips: 11%. */
+const MAX_ROUTABLE_FEE_PIPS = 110000;
+
+/**
+ * Uniswap's own routing rule for a v4 pool (uniroute-public, v4HooksPoolsFiltering.ts), ported:
+ * a pool is routed without an allowlist entry when its fee is static and at most 11%, and its hook
+ * address carries no swap permission and no swap return-delta permission. A hookless pool only
+ * has to pass the fee limit. `feePips` may be a number or a bigint, as a pool key read from a
+ * contract carries it.
+ */
+function isHooksPoolRoutable(hooks, feePips) {
+  const pips = Number(feePips);
+  const bits = Number(BigInt(hooks) & BigInt(ALL_HOOK_MASK));
+  const swap = bits & (HOOK_FLAGS.BEFORE_SWAP | HOOK_FLAGS.AFTER_SWAP);
+  const accounting = bits & (HOOK_FLAGS.BEFORE_SWAP_RETURNS_DELTA | HOOK_FLAGS.AFTER_SWAP_RETURNS_DELTA);
+  const dynamic = pips === DYNAMIC_FEE_FLAG;
+  return pips <= MAX_ROUTABLE_FEE_PIPS && (BigInt(hooks) === 0n || (!swap && !accounting && !dynamic));
+}
+
+module.exports.isHooksPoolRoutable = isHooksPoolRoutable;
