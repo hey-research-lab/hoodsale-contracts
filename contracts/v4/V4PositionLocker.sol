@@ -30,6 +30,9 @@ contract V4PositionLocker is Ownable, ReentrancyGuard {
 
     LockInfo[] public locks;
     mapping(address => uint256[]) private _locksOfOwner;
+    /// @dev Whether a lock id is already in an owner's raw list, so a lock handed back to a
+    ///      previous owner (or to its own owner) is not listed twice.
+    mapping(address => mapping(uint256 => bool)) private _inOwnerList;
     /// @notice The lock a position belongs to, plus one; zero means the position is not locked here
     mapping(uint256 => uint256) private _lockOfTokenPlusOne;
     /// @notice Contracts allowed to create locks (the launchers)
@@ -71,7 +74,7 @@ contract V4PositionLocker is Ownable, ReentrancyGuard {
 
         lockId = locks.length;
         locks.push(LockInfo({tokenId: tokenId, owner: owner_, unlockTime: unlockTime, withdrawn: false}));
-        _locksOfOwner[owner_].push(lockId);
+        _listForOwner(owner_, lockId);
         _lockOfTokenPlusOne[tokenId] = lockId + 1;
         emit Locked(lockId, tokenId, owner_, unlockTime);
     }
@@ -100,7 +103,7 @@ contract V4PositionLocker is Ownable, ReentrancyGuard {
         if (msg.sender != info.owner) revert NotLockOwner();
         require(newOwner != address(0), "zero owner");
         info.owner = newOwner;
-        _locksOfOwner[newOwner].push(lockId);
+        _listForOwner(newOwner, lockId);
         emit LockOwnershipTransferred(lockId, newOwner);
     }
 
@@ -121,6 +124,12 @@ contract V4PositionLocker is Ownable, ReentrancyGuard {
         params[1] = abi.encode(key.currency0, key.currency1, info.owner);
         positionManager.modifyLiquidities(abi.encode(actions, params), block.timestamp);
         emit FeesCollected(lockId, info.owner);
+    }
+
+    function _listForOwner(address owner_, uint256 lockId) private {
+        if (_inOwnerList[owner_][lockId]) return;
+        _inOwnerList[owner_][lockId] = true;
+        _locksOfOwner[owner_].push(lockId);
     }
 
     // ------------------------------------------------------------- views

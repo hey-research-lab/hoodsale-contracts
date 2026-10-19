@@ -472,6 +472,21 @@ describe("LiquidityLocker", function () {
       await locker.connect(bob).unlock(0);
       expect((await weth.balanceOf(bob.address)) - before).to.equal(amount);
     });
+
+    it("locksOfOwner lists a lock once after it is handed back or to its own owner", async function () {
+      const { locker, alice, bob } = await loadFixture(lockedFixture);
+
+      await locker.connect(alice).transferLockOwnership(0, bob.address);
+      await locker.connect(bob).transferLockOwnership(0, alice.address);
+      expect(await locker.locksOfOwner(alice.address)).to.deep.equal([0n]);
+      expect(await locker.locksOfOwner(bob.address)).to.deep.equal([]);
+
+      await locker.connect(alice).transferLockOwnership(0, alice.address);
+      expect(await locker.locksOfOwner(alice.address)).to.deep.equal([0n]);
+      const [ids, total] = await locker.locksOfOwnerPaged(alice.address, 0, 10);
+      expect(ids).to.deep.equal([0n]);
+      expect(total).to.equal(1n);
+    });
   });
 
   describe("views", function () {

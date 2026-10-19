@@ -23,6 +23,9 @@ contract LiquidityLocker is ReentrancyGuard {
     LockInfo[] public locks;
     mapping(address => uint256[]) private _locksOfOwner;
     mapping(address => uint256[]) private _locksOfToken;
+    /// @dev Whether a lock id is already in an owner's raw list, so a lock handed back to a
+    ///      previous owner (or to its own owner) is not listed twice.
+    mapping(address => mapping(uint256 => bool)) private _inOwnerList;
 
     event Locked(uint256 indexed lockId, address indexed token, address indexed owner, uint256 amount, uint64 unlockTime);
     event Unlocked(uint256 indexed lockId, address indexed owner, uint256 amount);
@@ -45,7 +48,7 @@ contract LiquidityLocker is ReentrancyGuard {
 
         lockId = locks.length;
         locks.push(LockInfo({token: token, owner: owner, amount: received, unlockTime: unlockTime, withdrawn: false}));
-        _locksOfOwner[owner].push(lockId);
+        _listForOwner(owner, lockId);
         _locksOfToken[token].push(lockId);
         emit Locked(lockId, token, owner, received, unlockTime);
     }
@@ -74,8 +77,14 @@ contract LiquidityLocker is ReentrancyGuard {
         require(msg.sender == info.owner, "not lock owner");
         require(newOwner != address(0), "zero owner");
         info.owner = newOwner;
-        _locksOfOwner[newOwner].push(lockId);
+        _listForOwner(newOwner, lockId);
         emit LockOwnershipTransferred(lockId, newOwner);
+    }
+
+    function _listForOwner(address owner, uint256 lockId) private {
+        if (_inOwnerList[owner][lockId]) return;
+        _inOwnerList[owner][lockId] = true;
+        _locksOfOwner[owner].push(lockId);
     }
 
     function lockCount() external view returns (uint256) {

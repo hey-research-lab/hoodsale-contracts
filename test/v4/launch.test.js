@@ -333,6 +333,20 @@ describe("V4 launch", function () {
       expect(await positionManager.ownerOf(launch.tokenId)).to.equal(alice.address);
     });
 
+    it("is listed once for its owner after it is handed back", async function () {
+      const ctx = await loadFixture(platform);
+      const { launcher, positionLocker, alice, bob } = ctx;
+      const tokenAddr = await createToken(ctx);
+      await launchThrough(ctx, tokenAddr, { liquidityAction: Lock });
+      const { lockId } = await launcher.launchOf(tokenAddr);
+
+      await positionLocker.connect(alice).transferLockOwnership(lockId, bob.address);
+      await positionLocker.connect(bob).transferLockOwnership(lockId, alice.address);
+      await positionLocker.connect(alice).transferLockOwnership(lockId, alice.address);
+      expect(await positionLocker.locksOfOwner(alice.address)).to.deep.equal([lockId]);
+      expect(await positionLocker.locksOfOwner(bob.address)).to.deep.equal([]);
+    });
+
     it("pays its LP fees to the lock owner without touching the principal", async function () {
       const ctx = await loadFixture(platform);
       const { launcher, positionLocker, positionManager, swapper, alice, bob } = ctx;
